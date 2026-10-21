@@ -10,13 +10,13 @@ Funzioni:
   * logging su file (con rotazione) + syslog; ogni fallimento genera un
     messaggio CRITICAL "MARIADB BACKUP DOWN" rilevabile dal monitoraggio
 
-Autenticazione (v4):
+Autenticazione:
   AUTH_MODE=socket   (consigliata) connessione via socket Unix con plugin
                      unix_socket: l'utente MariaDB coincide con l'utente di
                      sistema che esegue lo script e NON esiste alcuna password.
   AUTH_MODE=password solo se il database è su un altro host.
 
-Controllo accessi (v5):
+Controllo accessi:
   * lo script deve girare come utente di servizio (RUN_AS_USER, default
     "dbbackup"): ogni altro utente, root compreso, viene rifiutato;
   * il .env, lo script e le loro directory devono essere di root e non
@@ -25,13 +25,24 @@ Controllo accessi (v5):
   * qualunque arresto (segnale) genera un CRITICAL, così un backup fermato
     o interrotto viene sempre notato dal monitoraggio.
 
+Protezione dei backup:
+  * dump e binary log sono compressi e poi CRITTOGRAFATI con age verso una o
+    più chiavi PUBBLICHE (X25519 + ChaCha20-Poly1305, cifratura autenticata).
+    La chiave privata non sta sul server: chi ruba il server o i backup non
+    può leggerli;
+  * accanto a ogni archivio c'è un file .sha256 per verificare l'integrità
+    anche senza la chiave privata (--verify);
+  * umask 077: file 600 e directory 700, leggibili solo dall'utente di servizio.
+
 Modalità d'uso:
   mariadb_backup.py                  esegue un ciclo e termina (per cron/systemd)
   mariadb_backup.py --daemon         resta attivo e schedula con APScheduler
-  mariadb_backup.py --check          verifica configurazione e connessione
+  mariadb_backup.py --check          verifica configurazione, connessione e crittografia
+  mariadb_backup.py --verify         verifica i checksum SHA-256 di tutti gli archivi
 
 Dipendenze: solo libreria standard Python 3.8+ e i client MariaDB
-(mysqldump/mysql/mysqlbinlog). APScheduler serve solo per --daemon.
+(mysqldump/mysql/mysqlbinlog), più `age` (apt install age) se la crittografia
+è attiva. APScheduler serve solo per --daemon.
 """
 from __future__ import annotations
 
@@ -39,10 +50,12 @@ import argparse
 import datetime as dt
 import fcntl
 import gzip
+import hashlib
 import logging
 import logging.handlers
 import os
 import pwd
+import re
 import shlex
 import shutil
 import signal
@@ -200,6 +213,9 @@ class Config:
     mysqldump_bin: str
     mysql_bin: str
     mysqlbinlog_bin: str
+    encryption_enabled: bool
+    age_bin: str
+    age_recipients_file: Optional[Path]
     dump_extra_args: List[str] = field(default_factory=list)
 
     @property
@@ -209,6 +225,10 @@ class Config:
     @property
     def binlog_dir(self) -> Path:
         return self.backup_dir / "binlogs"
+
+    @property
+    def suffix(self) -> str:
+        return ".gz.age" if self.encryption_enabled else ".gz"
 
     @property
     def target(self) -> str:
@@ -244,6 +264,23 @@ class Config:
             db_password = _env_str("DB_PASSWORD", required=True)
 
         binlog_enabled = _env_bool("BINLOG_ENABLED", True)
+
+        encryption_enabled = _env_bool("ENCRYPTION_ENABLED", True)
+        recipients: Optional[Path] = None
+        if encryption_enabled:
+            recipients = Path(_env_str("AGE_RECIPIENTS_FILE", required=True))
+            if not recipients.is_file():
+                raise ConfigError(f"AGE_RECIPIENTS_FILE non trovato: {recipients}")
+            keys = [l.strip() for l in recipients.read_text(encoding="utf-8").splitlines()
+                    if l.strip() and not l.strip().startswith("#")]
+            if not keys:
+                raise ConfigError(f"{recipients} non contiene chiavi pubbliche")
+            for k in keys:
+                if k.startswith("AGE-SECRET-KEY-"):
+                    raise ConfigError(
+                        f"{recipients} contiene una CHIAVE PRIVATA: sul server va solo la chiave "
+                        "pubblica (age1...). Elimina subito quel file e considera la chiave compromessa"
+                    )
         schedule_time = _env_str("SCHEDULE_TIME", "02:15")
         try:
             dt.datetime.strptime(schedule_time, "%H:%M")
@@ -272,6 +309,9 @@ class Config:
                 _find_binary("MYSQLBINLOG_BIN", ["mariadb-binlog", "mysqlbinlog"])
                 if binlog_enabled else ""
             ),
+            encryption_enabled=encryption_enabled,
+            age_bin=_find_binary("AGE_BIN", ["age"]) if encryption_enabled else "",
+            age_recipients_file=recipients,
             dump_extra_args=shlex.split(_env_str("DUMP_EXTRA_ARGS", "")),
         )
 
@@ -414,6 +454,14 @@ def mysql_query(cfg: Config, cnf: str, sql: str, timeout: int = 120) -> List[Lis
     return [line.split("\t") for line in res.stdout.splitlines() if line]
 
 
+def mysql_scalar(cfg: Config, cnf: str, sql: str) -> str:
+    """Esegue una query che deve restituire un solo valore; errore chiaro se non lo fa."""
+    rows = mysql_query(cfg, cnf, sql)
+    if not rows or not rows[0]:
+        raise StepError(f"risposta vuota dal server per: {sql}")
+    return rows[0][0]
+
+
 def check_free_space(path: Path, min_free_mb: int) -> None:
     if min_free_mb <= 0:
         return
@@ -432,6 +480,102 @@ def _fsync_dir(path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Scrittura protetta degli archivi: gzip -> (age) -> .part -> rename + .sha256
+# --------------------------------------------------------------------------- #
+ARCHIVE_RE = re.compile(r"^(?P<base>.+?)\.gz(?P<enc>\.age)?$")
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+class ArchiveWriter:
+    """Comprime (gzip) e, se attivo, cifra con age i dati scritti con write().
+    Il file finale compare solo con commit(), insieme al suo .sha256; in caso di
+    errore o interruzione il file parziale viene eliminato."""
+
+    def __init__(self, cfg: Config, dest: Path):
+        self.cfg = cfg
+        self.dest = dest
+        self.part = dest.with_name(dest.name + ".part")
+        self._fh = None
+        self._age: Optional[subprocess.Popen] = None
+        self._age_err = None
+        self._gz: Optional[gzip.GzipFile] = None
+
+    def __enter__(self) -> "ArchiveWriter":
+        self._fh = open(self.part, "wb")
+        sink = self._fh
+        if self.cfg.encryption_enabled:
+            self._age_err = tempfile.TemporaryFile()
+            self._age = subprocess.Popen(
+                [self.cfg.age_bin, "--encrypt", "-R", str(self.cfg.age_recipients_file)],
+                stdin=subprocess.PIPE, stdout=self._fh, stderr=self._age_err,
+            )
+            sink = self._age.stdin
+        self._gz = gzip.GzipFile(fileobj=sink, mode="wb", compresslevel=6, mtime=0)
+        return self
+
+    def write(self, data: bytes) -> None:
+        try:
+            self._gz.write(data)
+        except BrokenPipeError:
+            raise StepError(f"age terminato durante la cifratura: {self._age_stderr()}")
+
+    def _age_stderr(self) -> str:
+        if self._age is None or self._age_err is None:
+            return ""
+        self._age.wait()
+        self._age_err.seek(0)
+        return _tail(self._age_err.read().decode("utf-8", "replace"))
+
+    def commit(self) -> Path:
+        try:
+            self._gz.close()
+            if self._age is not None:
+                self._age.stdin.close()
+                rc = self._age.wait()
+                if rc != 0:
+                    raise StepError(f"age ha restituito {rc}: {self._age_stderr()}")
+        except BrokenPipeError:
+            raise StepError(f"age terminato durante la cifratura: {self._age_stderr()}")
+        self._fh.flush()
+        os.fsync(self._fh.fileno())
+        self._fh.close()
+        os.replace(self.part, self.dest)
+        side = self.dest.with_name(self.dest.name + ".sha256")
+        side_tmp = side.with_name(side.name + ".part")
+        side_tmp.write_text(f"{sha256_file(self.dest)}  {self.dest.name}\n", encoding="utf-8")
+        os.replace(side_tmp, side)
+        _fsync_dir(self.dest.parent)
+        return self.dest
+
+    def abort(self) -> None:
+        for closer in (lambda: self._gz and self._gz.close(),
+                       lambda: self._age and self._age.stdin and self._age.stdin.close()):
+            try:
+                closer()
+            except Exception:  # noqa: BLE001
+                pass
+        if self._age is not None and self._age.poll() is None:
+            self._age.kill()
+            self._age.wait()
+        if self._fh is not None and not self._fh.closed:
+            self._fh.close()
+        self.part.unlink(missing_ok=True)
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if exc_type is not None:
+            self.abort()
+        if self._age_err is not None:
+            self._age_err.close()
+
+
+# --------------------------------------------------------------------------- #
 # Step 1: dump completo
 # --------------------------------------------------------------------------- #
 def run_full_backup(cfg: Config, cnf: str) -> Path:
@@ -439,8 +583,7 @@ def run_full_backup(cfg: Config, cnf: str) -> Path:
     check_free_space(cfg.full_dir, cfg.min_free_mb)
 
     ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    final = cfg.full_dir / f"{cfg.db_name}_{ts}.sql.gz"
-    part = final.with_name(final.name + ".part")
+    final = cfg.full_dir / f"{cfg.db_name}_{ts}.sql{cfg.suffix}"
 
     cmd = [
         cfg.mysqldump_bin,
@@ -462,39 +605,34 @@ def run_full_backup(cfg: Config, cnf: str) -> Path:
     log.debug("comando: %s", " ".join(shlex.quote(c) for c in cmd))
 
     tail = b""
-    with tempfile.TemporaryFile() as err:
+    with tempfile.TemporaryFile() as err, ArchiveWriter(cfg, final) as out:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err)
         try:
-            with open(part, "wb") as raw, gzip.GzipFile(fileobj=raw, mode="wb", compresslevel=6) as gz:
-                assert proc.stdout is not None
-                for chunk in iter(lambda: proc.stdout.read(1 << 20), b""):
-                    gz.write(chunk)
-                    tail = (tail + chunk)[-1024:]
-                gz.close()
-                raw.flush()
-                os.fsync(raw.fileno())
+            assert proc.stdout is not None
+            for chunk in iter(lambda: proc.stdout.read(1 << 20), b""):
+                out.write(chunk)
+                tail = (tail + chunk)[-1024:]
             rc = proc.wait()
         except BaseException:
             proc.kill()
             proc.wait()
-            part.unlink(missing_ok=True)
             raise
         err.seek(0)
         stderr = err.read().decode("utf-8", "replace")
 
-    if rc != 0:
-        part.unlink(missing_ok=True)
-        raise StepError(f"mysqldump terminato con codice {rc}: {_tail(stderr)}")
-    if b"-- Dump completed" not in tail:
-        part.unlink(missing_ok=True)
-        raise StepError("dump incompleto: manca il marker '-- Dump completed' a fine file")
-    if stderr.strip():
-        log.warning("mysqldump stderr: %s", _tail(stderr))
+        # Le verifiche avvengono PRIMA del commit: un dump non valido non
+        # diventa mai un file finale (l'uscita dal with con errore lo elimina).
+        if rc != 0:
+            raise StepError(f"mysqldump terminato con codice {rc}: {_tail(stderr)}")
+        if b"-- Dump completed" not in tail:
+            raise StepError("dump incompleto: manca il marker '-- Dump completed' a fine file")
+        if stderr.strip():
+            log.warning("mysqldump stderr: %s", _tail(stderr))
+        out.commit()
 
-    os.replace(part, final)
-    _fsync_dir(final.parent)
     size_mb = final.stat().st_size / (1024 * 1024)
-    log.info("dump completato: %s (%.1f MB compressi)", final.name, size_mb)
+    log.info("dump completato: %s (%.1f MB, %s)", final.name, size_mb,
+             "compresso e crittografato" if cfg.encryption_enabled else "compresso, NON crittografato")
     return final
 
 
@@ -504,12 +642,21 @@ def run_full_backup(cfg: Config, cnf: str) -> Path:
 def rotate_full_backups(cfg: Config) -> None:
     if not cfg.full_dir.is_dir():
         return
-    # Il timestamp YYYYmmdd_HHMMSS rende l'ordinamento per nome cronologico
-    backups = sorted(cfg.full_dir.glob(f"{cfg.db_name}_*.sql.gz"))
+    # Il timestamp YYYYmmdd_HHMMSS rende l'ordinamento per nome cronologico.
+    # Si considerano sia i dump crittografati (.sql.gz.age) sia quelli in chiaro
+    # (.sql.gz) di versioni precedenti, così questi ultimi escono dalla rotazione.
+    pattern = re.compile(rf"^{re.escape(cfg.db_name)}_\d{{8}}_\d{{6}}\.sql\.gz(\.age)?$")
+    backups = sorted((p for p in cfg.full_dir.iterdir() if pattern.match(p.name)),
+                     key=lambda p: p.name.split(".sql")[0])
     to_delete = backups[:-cfg.max_backups]
     for old in to_delete:
         old.unlink()
+        old.with_name(old.name + ".sha256").unlink(missing_ok=True)
         log.info("rotazione: eliminato %s", old.name)
+    plain = [p.name for p in backups[len(to_delete):] if not p.name.endswith(".age")]
+    if cfg.encryption_enabled and plain:
+        log.warning("%d dump NON crittografati (versioni precedenti) restano finché la "
+                    "rotazione non li elimina: %s", len(plain), ", ".join(plain))
     # File .part orfani lasciati da esecuzioni interrotte
     cutoff = dt.datetime.now().timestamp() - 86400
     for orphan in cfg.full_dir.glob("*.part"):
@@ -539,7 +686,8 @@ def archive_binlogs(cfg: Config, cnf: str) -> int:
     closed = names[:-1]  # l'ultimo è quello attivo, ancora in scrittura
 
     cfg.binlog_dir.mkdir(parents=True, exist_ok=True)
-    already = {p.name[:-3] for p in cfg.binlog_dir.rglob("*.gz") if p.is_file()}
+    already = {m.group("base") for p in cfg.binlog_dir.rglob("*")
+               if p.is_file() and (m := ARCHIVE_RE.match(p.name))}
     pending = [n for n in closed if n not in already]
     if not pending:
         log.info("binary log già tutti archiviati (%d sul server)", len(closed))
@@ -572,12 +720,14 @@ def archive_binlogs(cfg: Config, cnf: str) -> int:
             raw.unlink(missing_ok=True)
             raise StepError(f"mysqlbinlog fallito su {name}: {_tail(res.stderr)}")
 
-        dest = day_dir / f"{name}.gz"
-        tmp = dest.with_name(dest.name + ".part")
-        with open(raw, "rb") as src, gzip.open(tmp, "wb", compresslevel=6) as dst:
-            shutil.copyfileobj(src, dst, 1 << 20)
-        os.replace(tmp, dest)
-        raw.unlink()
+        dest = day_dir / f"{name}{cfg.suffix}"
+        try:
+            with open(raw, "rb") as src, ArchiveWriter(cfg, dest) as out:
+                for chunk in iter(lambda: src.read(1 << 20), b""):
+                    out.write(chunk)
+                out.commit()
+        finally:
+            raw.unlink(missing_ok=True)   # la copia in chiaro non resta mai su disco
         log.info("binlog archiviato: %s/%s", day_dir.name, dest.name)
 
     _fsync_dir(day_dir)
@@ -672,16 +822,58 @@ def run_job(cfg: Config) -> bool:
     return True
 
 
+def run_verify(cfg: Config) -> bool:
+    """Ricalcola lo SHA-256 di ogni archivio e lo confronta con il suo .sha256.
+    Non serve la chiave privata: rileva corruzione o file mancanti."""
+    ok = bad = missing = 0
+    for p in sorted(cfg.backup_dir.rglob("*")):
+        if not p.is_file() or not ARCHIVE_RE.match(p.name) or ".incoming" in p.parts:
+            continue
+        side = p.with_name(p.name + ".sha256")
+        if not side.is_file():
+            missing += 1
+            log.error("checksum mancante: %s", p.relative_to(cfg.backup_dir))
+            continue
+        expected = side.read_text(encoding="utf-8").split()[0]
+        if sha256_file(p) == expected:
+            ok += 1
+            log.debug("OK %s", p.relative_to(cfg.backup_dir))
+        else:
+            bad += 1
+            log.error("CHECKSUM ERRATO: %s", p.relative_to(cfg.backup_dir))
+    log.info("verifica: %d archivi integri, %d corrotti, %d senza checksum", ok, bad, missing)
+    if bad or missing:
+        notify_critical(f"verifica integrità fallita: {bad} archivi corrotti, {missing} senza checksum")
+        return False
+    return True
+
+
+def check_encryption(cfg: Config) -> None:
+    """Cifra un dato di prova: verifica che age funzioni e che le chiavi siano valide."""
+    res = subprocess.run([cfg.age_bin, "--encrypt", "-R", str(cfg.age_recipients_file)],
+                         input=b"test", capture_output=True, timeout=30)
+    if res.returncode != 0:
+        raise StepError(f"cifratura di prova fallita: {_tail(res.stderr.decode('utf-8', 'replace'))}")
+    n = sum(1 for l in cfg.age_recipients_file.read_text(encoding="utf-8").splitlines()
+            if l.strip() and not l.strip().startswith("#"))
+    log.info("crittografia OK: age, %d destinatari in %s", n, cfg.age_recipients_file)
+
+
 def run_check(cfg: Config) -> bool:
     try:
+        if cfg.encryption_enabled:
+            check_encryption(cfg)
+        else:
+            log.warning("ENCRYPTION_ENABLED=false: i backup NON sono crittografati")
         with credentials_file(cfg) as cnf:
-            version = mysql_query(cfg, cnf, "SELECT VERSION()")[0][0]
+            version = mysql_scalar(cfg, cnf, "SELECT VERSION()")
             log.info("connessione OK via %s come %s (auth %s) - server %s",
                      cfg.target, cfg.db_user, cfg.auth_mode, version)
             if cfg.binlog_enabled:
-                rows = mysql_query(cfg, cnf, "SELECT @@log_bin, @@binlog_format")
-                log.info("log_bin=%s binlog_format=%s", rows[0][0], rows[0][1])
-                if rows[0][0] not in ("1", "ON"):
+                log_bin = mysql_scalar(cfg, cnf, "SELECT @@log_bin")
+                log.info("log_bin=%s binlog_format=%s", log_bin,
+                         mysql_scalar(cfg, cnf, "SELECT @@binlog_format"))
+                if log_bin not in ("1", "ON"):
                     log.error("log_bin non attivo: il PITR non funzionerà")
                     return False
             grants = mysql_query(cfg, cnf, "SHOW GRANTS")
@@ -750,9 +942,11 @@ def main() -> int:
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--daemon", action="store_true", help="resta attivo e schedula con APScheduler")
     mode.add_argument("--check", action="store_true", help="verifica configurazione e connessione, poi esce")
+    mode.add_argument("--verify", action="store_true", help="verifica i checksum SHA-256 degli archivi, poi esce")
     parser.add_argument("-v", "--verbose", action="store_true", help="log DEBUG anche su console")
     args = parser.parse_args()
 
+    os.umask(0o077)   # tutto ciò che lo script crea è accessibile solo al proprietario
     user = current_os_user()
 
     def deny(reason: str) -> int:
@@ -806,6 +1000,18 @@ def main() -> int:
         notify_critical(f"configurazione non valida: {exc}")
         return 2
 
+    if cfg.encryption_enabled:
+        # Chi potesse sostituire la chiave pubblica riceverebbe backup leggibili solo da lui.
+        try:
+            check_protected_path(cfg.age_recipients_file, "il file delle chiavi pubbliche")
+            check_protected_path(cfg.age_recipients_file.resolve().parent,
+                                 "la directory del file delle chiavi pubbliche")
+        except (SecurityError, OSError) as exc:
+            notify_critical(f"installazione non sicura, backup NON eseguito: {exc}")
+            return 2
+    else:
+        log.warning("ENCRYPTION_ENABLED=false: i backup NON sono crittografati")
+
     if cfg.auth_mode == "password" and cfg.db_host in ("localhost", "127.0.0.1", "::1"):
         log.warning("AUTH_MODE=password con database locale: AUTH_MODE=socket è più sicura "
                     "(nessuna password salvata su disco). Vedi README.")
@@ -819,6 +1025,8 @@ def main() -> int:
 
     if args.check:
         return 0 if run_check(cfg) else 1
+    if args.verify:
+        return 0 if run_verify(cfg) else 1
     if args.daemon:
         return run_daemon(cfg)
 
