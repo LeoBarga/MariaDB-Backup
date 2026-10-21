@@ -16,6 +16,15 @@ Autenticazione (v4):
                      sistema che esegue lo script e NON esiste alcuna password.
   AUTH_MODE=password solo se il database è su un altro host.
 
+Controllo accessi (v5):
+  * lo script deve girare come utente di servizio (RUN_AS_USER, default
+    "dbbackup"): ogni altro utente, root compreso, viene rifiutato;
+  * il .env, lo script e le loro directory devono essere di root e non
+    scrivibili da altri, altrimenti il backup non parte (CRITICAL);
+  * i valori del .env hanno la precedenza sulle variabili d'ambiente;
+  * qualunque arresto (segnale) genera un CRITICAL, così un backup fermato
+    o interrotto viene sempre notato dal monitoraggio.
+
 Modalità d'uso:
   mariadb_backup.py                  esegue un ciclo e termina (per cron/systemd)
   mariadb_backup.py --daemon         resta attivo e schedula con APScheduler
@@ -50,6 +59,8 @@ APP_NAME = "mariadb-backup"
 DEFAULT_ENV_FILE = Path(__file__).resolve().with_name(".env")
 DEFAULT_LOG_FILE = "/var/log/mariadb-backup/backup.log"
 CRITICAL_TAG = "MARIADB BACKUP DOWN"
+DEFAULT_RUN_AS_USER = "dbbackup"
+EXIT_UNAUTHORIZED = 3
 
 log = logging.getLogger(APP_NAME)
 _syslog_ok = False
@@ -66,11 +77,22 @@ class StepError(Exception):
     """Errore atteso in uno step del job (messaggio già leggibile)."""
 
 
-def load_env_file(path: Path) -> None:
+class SecurityError(Exception):
+    """Configurazione dei permessi non sicura: il backup non deve partire."""
+
+
+class Interrupted(BaseException):
+    """Sollevata dal gestore dei segnali: interrompe il job in corso.
+    Deriva da BaseException così i singoli step non la "assorbono"."""
+
+
+def load_env_file(path: Path) -> dict:
     """Parser minimale di file .env: KEY=VALUE, commenti con #, virgolette opzionali.
-    Le variabili già presenti nell'ambiente hanno la precedenza."""
+    I valori del file SOVRASCRIVONO l'ambiente: la configurazione valida è solo
+    quella nel file protetto, non qualcosa passato da chi lancia il processo."""
     if not path.is_file():
-        return
+        raise ConfigError(f"file di configurazione non trovato: {path}")
+    values: dict = {}
     for lineno, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         line = raw.strip()
         if not line or line.startswith("#"):
@@ -83,7 +105,32 @@ def load_env_file(path: Path) -> None:
         key, value = key.strip(), value.strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
             value = value[1:-1]
-        os.environ.setdefault(key, value)
+        values[key] = value
+    os.environ.update(values)
+    return values
+
+
+def check_protected_path(path: Path, what: str, allow_world_read: bool = True) -> None:
+    """Il file (o la directory) deve appartenere a root e non essere scrivibile
+    da gruppo/altri: altrimenti un utente non privilegiato potrebbe cambiare la
+    configurazione o il codice eseguito dal servizio."""
+    st = path.stat()
+    mode = st.st_mode & 0o777
+    if st.st_uid != 0:
+        raise SecurityError(f"{what} {path} deve appartenere a root (proprietario uid={st.st_uid})")
+    if mode & 0o022:
+        raise SecurityError(f"{what} {path} è scrivibile da gruppo/altri (permessi {mode:o})")
+    if not allow_world_read and mode & 0o004:
+        raise SecurityError(f"{what} {path} è leggibile da tutti (permessi {mode:o}): usa chmod 640")
+
+
+def check_installation_security(env_file: Path) -> None:
+    script = Path(__file__).resolve()
+    env_file = env_file.resolve()
+    check_protected_path(env_file, "il file di configurazione", allow_world_read=False)
+    check_protected_path(env_file.parent, "la directory del file di configurazione")
+    check_protected_path(script, "lo script")
+    check_protected_path(script.parent, "la directory dello script")
 
 
 def _env_str(name: str, default: Optional[str] = None, required: bool = False) -> str:
@@ -232,7 +279,7 @@ class Config:
 # --------------------------------------------------------------------------- #
 # Logging
 # --------------------------------------------------------------------------- #
-def setup_logging(log_file: Path, verbose: bool) -> None:
+def setup_logging(log_file: Optional[Path], verbose: bool) -> None:
     global _syslog_ok
     log.setLevel(logging.DEBUG)
     log.handlers.clear()
@@ -243,16 +290,17 @@ def setup_logging(log_file: Path, verbose: bool) -> None:
     console.setFormatter(fmt)
     log.addHandler(console)
 
-    try:
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-        fh = logging.handlers.RotatingFileHandler(
-            log_file, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"
-        )
-        fh.setLevel(logging.DEBUG)
-        fh.setFormatter(fmt)
-        log.addHandler(fh)
-    except OSError as exc:
-        log.error("impossibile aprire il file di log %s: %s", log_file, exc)
+    if log_file is not None:
+        try:
+            log_file.parent.mkdir(parents=True, exist_ok=True)
+            fh = logging.handlers.RotatingFileHandler(
+                log_file, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"
+            )
+            fh.setLevel(logging.DEBUG)
+            fh.setFormatter(fmt)
+            log.addHandler(fh)
+        except OSError as exc:
+            log.error("impossibile aprire il file di log %s: %s", log_file, exc)
 
     _syslog_ok = False
     if os.path.exists("/dev/log"):
@@ -501,7 +549,10 @@ def archive_binlogs(cfg: Config, cnf: str) -> int:
     day_dir = cfg.binlog_dir / dt.date.today().isoformat()
     incoming = cfg.binlog_dir / ".incoming"
     day_dir.mkdir(exist_ok=True)
-    incoming.mkdir(exist_ok=True)
+    incoming.mkdir(exist_ok=True, mode=0o700)
+    for leftover in incoming.iterdir():   # residui di un'esecuzione interrotta
+        leftover.unlink()
+        log.info("rimosso residuo di download interrotto: %s", leftover.name)
 
     for name in pending:
         cmd = [
@@ -600,6 +651,9 @@ def run_job(cfg: Config) -> bool:
                         step("purge-server", purge_server_binlogs, cfg, cnf)
                     else:
                         log.warning("purge dei binlog sul server saltato: archiviazione fallita")
+    except Interrupted as exc:
+        errors.append(f"backup interrotto: {exc}")
+        log.error("backup interrotto: %s", exc)
     except StepError as exc:
         errors.append(str(exc))
         log.error("%s", exc)
@@ -667,13 +721,16 @@ def run_daemon(cfg: Config) -> int:
     scheduler.add_listener(on_event, EVENT_JOB_ERROR | EVENT_JOB_MISSED)
 
     def stop(signum, _frame) -> None:
-        log.info("ricevuto segnale %d, arresto scheduler", signum)
+        notify_critical(
+            f"daemon arrestato dal segnale {signal.Signals(signum).name}: "
+            "i backup schedulati NON verranno eseguiti finché il servizio non viene riavviato"
+        )
         scheduler.shutdown(wait=False)
 
-    signal.signal(signal.SIGTERM, stop)
-    signal.signal(signal.SIGINT, stop)
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, stop)
 
-    log.info("daemon avviato: backup giornaliero alle %s", cfg.schedule_time)
+    log.info("daemon avviato come %s: backup giornaliero alle %s", current_os_user(), cfg.schedule_time)
     try:
         scheduler.start()
     except Exception as exc:  # noqa: BLE001
@@ -696,17 +753,53 @@ def main() -> int:
     parser.add_argument("-v", "--verbose", action="store_true", help="log DEBUG anche su console")
     args = parser.parse_args()
 
+    user = current_os_user()
+
+    def deny(reason: str) -> int:
+        # Tentativo non autorizzato: WARNING (finisce comunque nel syslog per audit),
+        # non CRITICAL, altrimenti chiunque potrebbe generare falsi allarmi.
+        log.warning("esecuzione rifiutata per l'utente %s (uid %d): %s", user, os.geteuid(), reason)
+        print(f"Permesso negato: {reason}", file=sys.stderr)
+        return EXIT_UNAUTHORIZED
+
     env_error: Optional[str] = None
+    file_values: dict = {}
     try:
-        load_env_file(args.env_file)
+        file_values = load_env_file(args.env_file)
+    except PermissionError:
+        setup_logging(None, args.verbose)
+        return deny(f"impossibile leggere {args.env_file}. Il backup va gestito con sudo, "
+                    "es. 'sudo systemctl start mariadb-backup'")
     except (ConfigError, OSError) as exc:
         env_error = str(exc)
 
-    setup_logging(Path(os.environ.get("LOG_FILE", DEFAULT_LOG_FILE)), args.verbose)
+    # Il controllo dell'utente va fatto PRIMA di aprire il file di log:
+    # se root lo creasse, il file diventerebbe di root e il servizio non
+    # potrebbe più scriverci.
+    run_as = file_values.get("RUN_AS_USER", DEFAULT_RUN_AS_USER)
+    if not env_error and user != run_as:
+        setup_logging(None, args.verbose)
+        hint = (f"non eseguire lo script come root: usa 'sudo -u {run_as} {Path(__file__).resolve()} ...' "
+                "oppure 'sudo systemctl ...'") if os.geteuid() == 0 else \
+               f"lo script può essere eseguito solo come '{run_as}' (tramite sudo)"
+        return deny(hint)
+
+    # Con .env illeggibile/non valido non si sa chi sia l'utente autorizzato:
+    # se è root, niente file di log (stesso motivo di sopra), solo console e syslog.
+    log_file = None if (env_error and os.geteuid() == 0) else \
+        Path(os.environ.get("LOG_FILE", DEFAULT_LOG_FILE))
+    setup_logging(log_file, args.verbose)
 
     if env_error:
         notify_critical(f"errore nel file di configurazione: {env_error}")
         return 2
+
+    try:
+        check_installation_security(args.env_file)
+    except (SecurityError, OSError) as exc:
+        notify_critical(f"installazione non sicura, backup NON eseguito: {exc}")
+        return 2
+
     try:
         cfg = Config.from_env()
     except ConfigError as exc:
@@ -728,12 +821,21 @@ def main() -> int:
         return 0 if run_check(cfg) else 1
     if args.daemon:
         return run_daemon(cfg)
+
+    def interrupt(signum, _frame) -> None:
+        raise Interrupted(f"ricevuto {signal.Signals(signum).name}")
+
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, interrupt)
     return 0 if run_job(cfg) else 1
 
 
 if __name__ == "__main__":
     try:
         sys.exit(main())
+    except Interrupted as exc:  # segnale arrivato fuori dal job
+        notify_critical(f"esecuzione interrotta: {exc}")
+        sys.exit(1)
     except Exception as exc:  # noqa: BLE001 - rete di sicurezza finale
         try:
             notify_critical(f"crash non gestito: {exc}\n{traceback.format_exc()}")
