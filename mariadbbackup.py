@@ -10,6 +10,12 @@ Funzioni:
   * logging su file (con rotazione) + syslog; ogni fallimento genera un
     messaggio CRITICAL "MARIADB BACKUP DOWN" rilevabile dal monitoraggio
 
+Autenticazione (v4):
+  AUTH_MODE=socket   (consigliata) connessione via socket Unix con plugin
+                     unix_socket: l'utente MariaDB coincide con l'utente di
+                     sistema che esegue lo script e NON esiste alcuna password.
+  AUTH_MODE=password solo se il database è su un altro host.
+
 Modalità d'uso:
   mariadb_backup.py                  esegue un ciclo e termina (per cron/systemd)
   mariadb_backup.py --daemon         resta attivo e schedula con APScheduler
@@ -27,6 +33,7 @@ import gzip
 import logging
 import logging.handlers
 import os
+import pwd
 import shlex
 import shutil
 import signal
@@ -122,8 +129,14 @@ def _find_binary(env_name: str, candidates: List[str]) -> str:
     )
 
 
+def current_os_user() -> str:
+    return pwd.getpwuid(os.geteuid()).pw_name
+
+
 @dataclass
 class Config:
+    auth_mode: str          # "socket" | "password"
+    db_socket: str
     db_host: str
     db_port: int
     db_name: str
@@ -150,8 +163,39 @@ class Config:
     def binlog_dir(self) -> Path:
         return self.backup_dir / "binlogs"
 
+    @property
+    def target(self) -> str:
+        """Descrizione leggibile della connessione, per i log."""
+        if self.auth_mode == "socket":
+            return f"socket {self.db_socket}"
+        return f"{self.db_host}:{self.db_port}"
+
     @classmethod
     def from_env(cls) -> "Config":
+        auth_mode = _env_str("AUTH_MODE", "socket").lower()
+        if auth_mode not in ("socket", "password"):
+            raise ConfigError(f"AUTH_MODE deve essere 'socket' o 'password' (valore: {auth_mode!r})")
+
+        if auth_mode == "socket":
+            os_user = current_os_user()
+            # Con unix_socket MariaDB accetta solo l'utente con lo stesso nome
+            # dell'utente di sistema: un DB_USER diverso non potrebbe mai funzionare.
+            db_user = _env_str("DB_USER", os_user)
+            if db_user != os_user:
+                raise ConfigError(
+                    f"AUTH_MODE=socket: DB_USER ({db_user!r}) deve coincidere con l'utente "
+                    f"di sistema che esegue lo script ({os_user!r})"
+                )
+            if os.environ.get("DB_PASSWORD"):
+                raise ConfigError(
+                    "AUTH_MODE=socket non usa password: rimuovi DB_PASSWORD dal .env "
+                    "(non va lasciata salvata su disco inutilmente)"
+                )
+            db_password = ""
+        else:
+            db_user = _env_str("DB_USER", required=True)
+            db_password = _env_str("DB_PASSWORD", required=True)
+
         binlog_enabled = _env_bool("BINLOG_ENABLED", True)
         schedule_time = _env_str("SCHEDULE_TIME", "02:15")
         try:
@@ -160,11 +204,13 @@ class Config:
             raise ConfigError(f"SCHEDULE_TIME deve essere HH:MM (valore: {schedule_time!r})")
 
         return cls(
+            auth_mode=auth_mode,
+            db_socket=_env_str("DB_SOCKET", "/run/mysqld/mysqld.sock"),
             db_host=_env_str("DB_HOST", "localhost"),
             db_port=_env_int("DB_PORT", 3306, minimum=1),
             db_name=_env_str("DB_NAME", required=True),
-            db_user=_env_str("DB_USER", required=True),
-            db_password=_env_str("DB_PASSWORD", ""),
+            db_user=db_user,
+            db_password=db_password,
             backup_dir=Path(_env_str("BACKUP_DIR", required=True)).expanduser(),
             max_backups=_env_int("MAX_BACKUPS", 5, minimum=1),
             binlog_enabled=binlog_enabled,
@@ -261,15 +307,22 @@ def _quote_cnf(value: str) -> str:
 
 @contextmanager
 def credentials_file(cfg: Config) -> Iterator[str]:
-    """File di opzioni temporaneo (0600): la password non compare mai in `ps`."""
+    """File di opzioni temporaneo (0600) passato ai client con --defaults-extra-file.
+    In modalità socket non contiene segreti; in modalità password evita che la
+    password compaia negli argomenti del processo (visibili con `ps`)."""
     fd, path = tempfile.mkstemp(prefix=".mariadb-backup-", suffix=".cnf")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write("[client]\n")
-            f.write(f"host={_quote_cnf(cfg.db_host)}\n")
-            f.write(f"port={cfg.db_port}\n")
-            f.write(f"user={_quote_cnf(cfg.db_user)}\n")
-            if cfg.db_password:
+            if cfg.auth_mode == "socket":
+                f.write(f"socket={_quote_cnf(cfg.db_socket)}\n")
+                f.write("protocol=SOCKET\n")
+                f.write(f"user={_quote_cnf(cfg.db_user)}\n")
+            else:
+                f.write(f"host={_quote_cnf(cfg.db_host)}\n")
+                f.write(f"port={cfg.db_port}\n")
+                f.write("protocol=TCP\n")
+                f.write(f"user={_quote_cnf(cfg.db_user)}\n")
                 f.write(f"password={_quote_cnf(cfg.db_password)}\n")
         os.chmod(path, 0o600)
         yield path
@@ -526,7 +579,8 @@ def run_job(cfg: Config) -> bool:
             errors.append(f"{name}: {type(exc).__name__}: {exc}")
         return False
 
-    log.info("=== inizio backup '%s' su %s:%d ===", cfg.db_name, cfg.db_host, cfg.db_port)
+    log.info("=== inizio backup '%s' via %s (utente %s, auth %s) ===",
+             cfg.db_name, cfg.target, cfg.db_user, cfg.auth_mode)
     try:
         cfg.backup_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         with run_lock(cfg.backup_dir / ".backup.lock"), credentials_file(cfg) as cnf:
@@ -556,7 +610,7 @@ def run_job(cfg: Config) -> bool:
     elapsed = (dt.datetime.now() - started).total_seconds()
     if errors:
         notify_critical(
-            f"db={cfg.db_name} host={cfg.db_host} - {len(errors)} errore/i in {elapsed:.0f}s: "
+            f"db={cfg.db_name} target={cfg.target} - {len(errors)} errore/i in {elapsed:.0f}s: "
             + " | ".join(errors)
         )
         return False
@@ -568,7 +622,8 @@ def run_check(cfg: Config) -> bool:
     try:
         with credentials_file(cfg) as cnf:
             version = mysql_query(cfg, cnf, "SELECT VERSION()")[0][0]
-            log.info("connessione OK - server %s", version)
+            log.info("connessione OK via %s come %s (auth %s) - server %s",
+                     cfg.target, cfg.db_user, cfg.auth_mode, version)
             if cfg.binlog_enabled:
                 rows = mysql_query(cfg, cnf, "SELECT @@log_bin, @@binlog_format")
                 log.info("log_bin=%s binlog_format=%s", rows[0][0], rows[0][1])
@@ -657,6 +712,10 @@ def main() -> int:
     except ConfigError as exc:
         notify_critical(f"configurazione non valida: {exc}")
         return 2
+
+    if cfg.auth_mode == "password" and cfg.db_host in ("localhost", "127.0.0.1", "::1"):
+        log.warning("AUTH_MODE=password con database locale: AUTH_MODE=socket è più sicura "
+                    "(nessuna password salvata su disco). Vedi README.")
 
     if cfg.binlog_enabled and cfg.binlog_retention_days < cfg.max_backups:
         log.warning(
